@@ -4,6 +4,7 @@ import logging
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup  # ✅ 新增的網頁解析套件
 import firebase_admin
 from firebase_admin import credentials, firestore, db
 
@@ -47,7 +48,7 @@ def initialize_firebase_safe():
         raise
 
 # ==========================================
-# 第二部分：工廠模式爬蟲架構 (以擷取統一投信為例)
+# 第二部分：工廠模式爬蟲架構 (真實網頁解析)
 # ==========================================
 class ActiveETFScraper:
     """主動式 ETF 爬蟲基底類別"""
@@ -62,21 +63,62 @@ class ActiveETFScraper:
         raise NotImplementedError
 
 class TongYiScraper(ActiveETFScraper):
-    """統一投信解析器 (負責 00403A, 00981A, 00988A 等)"""
+    """真實版統一投信網頁解析器 (負責 00403A, 00981A, 00988A 等)"""
     def fetch_daily_data(self) -> dict:
-        logger.info(f"啟動 {self.etf_id} 數據擷取程序...")
-        # 實務上這裡會使用 requests 請求統一投信的 API 或 BeautifulSoup 解析 HTML
-        # 為了確保系統順利運行，此處建立示範用的記憶體字典 (Dictionary) 回傳結構
-        # 未來只需修改此區塊，即可無縫對接真實網頁原始碼
-        
+        logger.info(f"啟動 {self.etf_id} 真實數據擷取程序...")
         today_str = datetime.now().strftime('%Y-%m-%d')
+        portfolio_changes = []
+
+        # 這裡設定投信官網的持股權重公告網址
+        # (實務上各家投信網址結構不同，此為統一投信標準公開資訊架構的範例)
+        url = f"https://www.ezmoney.com.tw/ETF/Portfolio/{self.etf_id}"
+
+        try:
+            # 1. 向投信伺服器發送真實網頁請求
+            response = requests.get(url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+
+            # 2. 啟動 BeautifulSoup 解析 HTML 網頁結構
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 3. 鎖定網頁中的「持股明細表格」 (根據實際網頁的 class 或 id 定位)
+            # 若未來投信網頁改版，只需微調此處的 class 名稱 'portfolio-table' 即可
+            table = soup.find('table', {'class': 'portfolio-table'})
+
+            if table:
+                rows = table.find('tbody').find_all('tr')
+                for row in rows:
+                    cols = row.find_all('td')
+                    
+                    # 確保該橫列有足夠的資料欄位 (代號、名稱、權重、增減動向)
+                    if len(cols) >= 4:
+                        stock_id = cols[0].text.strip()
+                        stock_name = cols[1].text.strip()
+                        # 處理百分比符號並轉為浮點數
+                        weight = float(cols[2].text.strip().replace('%', ''))
+                        action = cols[3].text.strip() 
+
+                        # 核心篩選：我們只抓取具備波段動能的「加碼」與「新增」標的
+                        if action in ["加碼", "新增"]:
+                            portfolio_changes.append({
+                                "stock_id": stock_id,
+                                "stock_name": stock_name,
+                                "action": action,
+                                "weight": weight
+                            })
+            else:
+                logger.warning(f"無法在 {url} 找到持股表格，可能網頁結構尚未更新或已異動。")
+
+        except requests.RequestException as e:
+            logger.error(f"抓取 {self.etf_id} 投信網頁失敗: {e}")
+        except Exception as e:
+            logger.error(f"解析 {self.etf_id} 數據時發生未預期的錯誤: {e}")
+
+        # 4. 回傳標準化格式，準備與外資數據進行聯集比對
         return {
             "date": today_str,
             "etf_id": self.etf_id,
-            "portfolio_changes": [
-                {"stock_id": "3037", "stock_name": "欣興", "action": "加碼", "weight": 4.63},
-                {"stock_id": "3017", "stock_name": "奇鋐", "action": "加碼", "weight": 4.41}
-            ]
+            "portfolio_changes": portfolio_changes
         }
 
 def scraper_factory(etf_id: str) -> ActiveETFScraper:
@@ -138,7 +180,7 @@ class QuantAnalyzer:
         buy_records = []
         for etf_data in etf_data_list:
             for item in etf_data.get("portfolio_changes", []):
-                if item["action"] == "加碼":
+                if item["action"] in ["加碼", "新增"]:
                     buy_records.append({
                         "etf_id": etf_data["etf_id"],
                         "stock_id": item["stock_id"],
